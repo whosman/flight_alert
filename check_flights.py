@@ -36,9 +36,10 @@ RET_DAYS = (6, 0)  # come back Sun, Mon
 REALERT_DROP = 10  # re-alert an already-emailed trip if it gets this much cheaper
 DIGEST_HOUR = 8  # daily "still working" summary email on first run after this hour (PT)
 DIGEST = (os.environ.get("DIGEST") or "1") != "0"
-WORKERS = 4
-MAX_FAIL_RATE = 0.2  # more failed searches than this = broken
-MAX_EMPTY_RATE = 0.5  # more "no flights" pages than this = Google changed something
+WORKERS = 2  # parallel searches; low to avoid Google rate limiting
+ATTEMPTS = 5  # tries per search
+MAX_FAIL_RATE = 0.2  # more failed searches than this = a bad run
+BAD_RUNS_BEFORE_ALERT = 3  # only report trouble after this many bad runs in a row
 STATE_FILE = Path(__file__).with_name("alerted.json")
 TZ = ZoneInfo("America/Vancouver")
 # -----------------------------------------------------------------------------
@@ -98,18 +99,25 @@ def parse_all(html: str):
 
 
 def fetch(job):
-    """job = (kind, legs). Returns (job, url, cheapest flight | None)."""
+    """job = (kind, legs). Returns (job, url, cheapest flight).
+
+    Google sometimes returns a blank result page to cloud servers (soft rate
+    limiting). These routes always have flights, so a blank page is treated as
+    an error and retried with a fresh connection, never as "no flights".
+    """
     kind, legs = job
     q = make_query(legs, kind)
     err = None
-    for attempt in range(4):
-        time.sleep(random.uniform(0.5, 2.0))
+    for attempt in range(ATTEMPTS):
+        time.sleep(random.uniform(1.0, 3.0))
         try:
             flights = parse_all(fetch_flights_html(q))
-            return job, q.url(), (min(flights, key=lambda f: f.price) if flights else None)
+            if not flights:
+                raise RuntimeError("blank result page")
+            return job, q.url(), min(flights, key=lambda f: f.price)
         except Exception as e:  # noqa: BLE001
             err = e
-            time.sleep(4 * (attempt + 1) + random.uniform(0, 3))
+            time.sleep(5 * (attempt + 1) + random.uniform(0, 5))
     raise RuntimeError(f"{kind} {legs}: {err!r}")
 
 
@@ -162,11 +170,16 @@ def deal_message(deal):
     return title, body, links
 
 
-def notify(subject: str, body: str, priority: int = 3, links=()) -> bool:
-    """Push via ntfy (if NTFY_TOPIC set) and email (if SMTP set). True if anything was sent."""
+def notify(subject: str, body: str, priority: int = 3, links=(), admin: bool = False) -> bool:
+    """Push via ntfy and email (each if configured). True if anything was sent.
+
+    admin=True sends to NTFY_ADMIN_TOPIC (health notices) when it is set.
+    """
     sent = False
     mail = body + ("\n\n" + "\n".join(f"{label}: {url}" for label, url in links) if links else "")
-    for fn in (lambda: send_ntfy(subject, body, priority, links), lambda: send_email(subject, mail)):
+    topic = (os.environ.get("NTFY_ADMIN_TOPIC") if admin else None) or os.environ.get("NTFY_TOPIC")
+    for fn in (lambda: send_ntfy(subject, body, priority, links, topic),
+               lambda: send_email(subject, mail)):
         try:
             sent = fn() or sent
         except Exception as e:  # noqa: BLE001
@@ -176,8 +189,7 @@ def notify(subject: str, body: str, priority: int = 3, links=()) -> bool:
     return sent
 
 
-def send_ntfy(title: str, body: str, priority: int, links) -> bool:
-    topic = os.environ.get("NTFY_TOPIC")
+def send_ntfy(title: str, body: str, priority: int, links, topic: str | None) -> bool:
     if not topic:
         return False
     msg = {"topic": topic, "title": title, "message": body[:3900], "priority": priority}
@@ -287,8 +299,7 @@ def main() -> int:
 
     # ---- health ----
     total, nfail = len(jobs), len(failed)
-    nempty = sum(1 for url, best in results.values() if best is None)
-    broken = nfail / total > MAX_FAIL_RATE or nempty / total > MAX_EMPTY_RATE
+    broken = nfail / total > MAX_FAIL_RATE
 
     # ---- alerts ----
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
@@ -361,21 +372,26 @@ def main() -> int:
                              for h, a, o, r, was, now_p in gone)
         notify(title, body, priority=3)
 
-    print(f"\n{total - nfail}/{total} searches OK ({nempty} empty), {len(deals)} new deal(s), "
+    print(f"\n{total - nfail}/{total} searches OK, {len(deals)} new deal(s), "
           f"{len(nears)} almost, {len(gone)} gone")
     write_summary(table, now, nfail, total)
 
-    if broken and state.get("last_fail_email") != today.isoformat():
+    # Health notices go to the admin topic, and only for trouble that lasts.
+    state["bad_runs"] = state.get("bad_runs", 0) + 1 if broken else 0
+    if state["bad_runs"] >= BAD_RUNS_BEFORE_ALERT and state.get("last_fail_email") != today.isoformat():
         run = os.environ.get("GITHUB_RUN_ID")
         links = ([("Open the logs", f"{os.environ.get('GITHUB_SERVER_URL')}/"
                    f"{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{run}")] if run else [])
-        why = (f"{nfail} of {total} searches failed" if nfail / total > MAX_FAIL_RATE
-               else f"{nempty} of {total} searches came back empty")
         if notify("Flight checker is failing",
-                  f"At {clock((now.hour, now.minute))}, {why}. Google may be blocking the checker, "
-                  "or its page has changed. You will get this once a day until it is fixed.",
-                  priority=4, links=links):
+                  f"The last {state['bad_runs']} runs had too many failed searches "
+                  f"({nfail} of {total} this time). Google may be blocking the checker. "
+                  "You will get this at most once a day.",
+                  priority=3, links=links, admin=True):
             state["last_fail_email"] = today.isoformat()
+            state["fail_notified"] = True
+    if not broken and state.pop("fail_notified", False):
+        notify("Flight checker is working again", f"{total - nfail} of {total} searches worked.",
+               priority=2, admin=True)
 
     if DIGEST and now.hour >= DIGEST_HOUR and state.get("last_digest") != today.isoformat():
         title, body = digest(table, nfail, total)

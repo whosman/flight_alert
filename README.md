@@ -14,8 +14,13 @@ Watches Google Flights every hour for cheap weekend round trips between Victoria
 | Almost | A trip is under `NEAR_PRICE` (default $250). | Normal |
 | Deal gone | A trip that was a deal went back up or sold out. | Normal |
 | Daily check | Lowest price per weekend, first run after 8am Pacific. | Low |
-| Failing | Over 20% of searches failed, or over half came back empty. Once a day. | High |
-| Crashed / stopped | A run crashed, or the hourly chain could not start the next run. | High |
+| Failing | Over 20% of searches failed in 3 runs in a row. At most once a day. | Admin topic |
+| Working again | The first good run after a "failing" notice. | Admin topic |
+| Crashed / stopped | A run crashed, or the hourly chain could not start the next run. | Admin topic |
+
+Health notices go to `NTFY_ADMIN_TOPIC` when it is set, so people who only want deals can subscribe to `NTFY_TOPIC` alone.
+
+Google sometimes returns blank result pages to cloud servers. A blank page is retried (up to 5 times, with backoff) and never counted as "no flights".
 
 ## How it runs
 GitHub's cron schedule is unreliable, so each run starts the next one. The `next` job waits about an hour on the `hourly` environment's wait timer (no runner minutes used), then dispatches a new run. The cron schedule stays as a backup. If several chains ever overlap, only the newest run continues.
@@ -23,7 +28,7 @@ GitHub's cron schedule is unreliable, so each run starts the next one. The `next
 To restart the chain: `gh workflow run check.yml`
 
 ## Settings
-Secret: `NTFY_TOPIC` (required). Optional email: `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO`.
+Secrets: `NTFY_TOPIC` (required), `NTFY_ADMIN_TOPIC` (health notices). Optional email: `SMTP_USER`, `SMTP_PASS`, `EMAIL_TO`.
 
 Repository variables:
 ```

@@ -12,7 +12,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     concurrency:
       group: check-flights
       cancel-in-progress: false
@@ -26,6 +26,7 @@ jobs:
       - run: python check_flights.py
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_ADMIN_TOPIC: ${{ secrets.NTFY_ADMIN_TOPIC }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
@@ -36,7 +37,7 @@ jobs:
       - name: Push a notice if the run crashed
         if: failure()
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TOPIC: ${{ secrets.NTFY_ADMIN_TOPIC || secrets.NTFY_TOPIC }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           curl -sS --retry 3 \
@@ -45,7 +46,7 @@ jobs:
             -H "Click: $RUN_URL" \
             -H "Actions: view, Open the logs, $RUN_URL" \
             -d "The last run stopped with an error, so it may have missed fares. It will try again within the hour." \
-            "https://ntfy.sh/$NTFY_TOPIC"
+            "https://ntfy.sh/$TOPIC"
       - name: Save alert state
         if: always()
         run: |
@@ -71,7 +72,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TOPIC: ${{ secrets.NTFY_ADMIN_TOPIC || secrets.NTFY_TOPIC }}
           RUN_ID: ${{ github.run_id }}
         run: |
           newest=$(gh run list --workflow check.yml --limit 1 --json databaseId --jq '.[0].databaseId')
@@ -85,5 +86,5 @@ jobs:
           done
           curl -sS --retry 3 -H "Title: Flight checker stopped" -H "Priority: 4" \
             -d "It could not schedule its next run. Restart it with: gh workflow run check.yml -R $GH_REPO" \
-            "https://ntfy.sh/$NTFY_TOPIC"
+            "https://ntfy.sh/$TOPIC"
           exit 1
